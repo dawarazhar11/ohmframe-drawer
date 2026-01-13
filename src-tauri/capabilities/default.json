@@ -1,14 +1,28 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "Capability for the main window",
+  "description": "Default capabilities for Ohmframe Drawer",
   "windows": ["main"],
   "permissions": [
     "core:default",
+    "core:path:default",
+    "shell:allow-open",
     "opener:default",
     "dialog:default",
-    "fs:default",
-    "shell:default",
-    "http:default"
+    "dialog:allow-open",
+    "fs:allow-read-file",
+    {
+      "identifier": "fs:scope",
+      "allow": [
+        { "path": "$RESOURCE/**" }
+      ]
+    },
+    {
+      "identifier": "http:default",
+      "allow": [
+        { "url": "https://ai.ohmframe.com/**" },
+        { "url": "https://*.ohmframe.com/**" }
+      ]
+    }
   ]
 }
