@@ -1,4 +1,4 @@
-import { useState, useCallback, useRef, useEffect } from "react";
+import { useState, useCallback, useRef, useEffect, useMemo } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
 import { readFile } from "@tauri-apps/plugin-fs";
@@ -7,6 +7,7 @@ import { OrbitControls, Center } from "@react-three/drei";
 import * as THREE from "three";
 
 import { generateDimensions } from "./lib/ai/claude";
+import { loadStepToMesh } from "./lib/step/stepLoader";
 import {
   renderDrawingSheet,
   generateOrthographicViews,
@@ -21,30 +22,35 @@ import type {
 
 import "./App.css";
 
-// Simple 3D Mesh Viewer
+// 3D Mesh Viewer Component
 function MeshViewer({ meshData }: { meshData: MeshData | null }) {
-  if (!meshData) {
+  const geometry = useMemo(() => {
+    if (!meshData) return null;
+
+    const geo = new THREE.BufferGeometry();
+    geo.setAttribute(
+      "position",
+      new THREE.BufferAttribute(meshData.positions, 3)
+    );
+    geo.setIndex(new THREE.BufferAttribute(meshData.indices, 1));
+    if (meshData.normals) {
+      geo.setAttribute(
+        "normal",
+        new THREE.BufferAttribute(meshData.normals, 3)
+      );
+    } else {
+      geo.computeVertexNormals();
+    }
+    return geo;
+  }, [meshData]);
+
+  if (!geometry) {
     return (
       <mesh>
         <boxGeometry args={[1, 1, 1]} />
-        <meshStandardMaterial color="#666" wireframe />
+        <meshStandardMaterial color="#444" wireframe />
       </mesh>
     );
-  }
-
-  const geometry = new THREE.BufferGeometry();
-  geometry.setAttribute(
-    "position",
-    new THREE.BufferAttribute(meshData.positions, 3)
-  );
-  geometry.setIndex(new THREE.BufferAttribute(meshData.indices, 1));
-  if (meshData.normals) {
-    geometry.setAttribute(
-      "normal",
-      new THREE.BufferAttribute(meshData.normals, 3)
-    );
-  } else {
-    geometry.computeVertexNormals();
   }
 
   return (
@@ -120,30 +126,50 @@ function App() {
 
       setStepData(result);
 
-      // Create placeholder mesh from bounding box
-      if (result.bounding_box) {
-        const bbox = result.bounding_box;
-        const positions = new Float32Array([
-          // Front face
-          bbox.min_x, bbox.min_y, bbox.max_z,
-          bbox.max_x, bbox.min_y, bbox.max_z,
-          bbox.max_x, bbox.max_y, bbox.max_z,
-          bbox.min_x, bbox.max_y, bbox.max_z,
-          // Back face
-          bbox.min_x, bbox.min_y, bbox.min_z,
-          bbox.min_x, bbox.max_y, bbox.min_z,
-          bbox.max_x, bbox.max_y, bbox.min_z,
-          bbox.max_x, bbox.min_y, bbox.min_z,
-        ]);
-        const indices = new Uint32Array([
-          0, 1, 2, 0, 2, 3, // front
-          4, 5, 6, 4, 6, 7, // back
-          0, 3, 5, 0, 5, 4, // left
-          1, 7, 6, 1, 6, 2, // right
-          3, 2, 6, 3, 6, 5, // top
-          0, 4, 7, 0, 7, 1, // bottom
-        ]);
-        setMeshData({ positions, indices });
+      // Load actual mesh using occt-import-js WASM
+      try {
+        console.log("[App] Loading mesh from STEP content...");
+        const occtMesh = await loadStepToMesh(content);
+        
+        if (occtMesh) {
+          console.log("[App] Mesh loaded successfully:", {
+            vertices: occtMesh.vertices.length / 3,
+            indices: occtMesh.indices.length,
+          });
+          setMeshData({
+            positions: new Float32Array(occtMesh.vertices),
+            indices: new Uint32Array(occtMesh.indices),
+            normals: new Float32Array(occtMesh.normals),
+          });
+        } else {
+          console.warn("[App] OCCT mesh loading failed, using bounding box fallback");
+          // Fallback to bounding box if OCCT fails
+          if (result.bounding_box) {
+            const bbox = result.bounding_box;
+            const positions = new Float32Array([
+              bbox.min_x, bbox.min_y, bbox.max_z,
+              bbox.max_x, bbox.min_y, bbox.max_z,
+              bbox.max_x, bbox.max_y, bbox.max_z,
+              bbox.min_x, bbox.max_y, bbox.max_z,
+              bbox.min_x, bbox.min_y, bbox.min_z,
+              bbox.min_x, bbox.max_y, bbox.min_z,
+              bbox.max_x, bbox.max_y, bbox.min_z,
+              bbox.max_x, bbox.min_y, bbox.min_z,
+            ]);
+            const indices = new Uint32Array([
+              0, 1, 2, 0, 2, 3,
+              4, 5, 6, 4, 6, 7,
+              0, 3, 5, 0, 5, 4,
+              1, 7, 6, 1, 6, 2,
+              3, 2, 6, 3, 6, 5,
+              0, 4, 7, 0, 7, 1,
+            ]);
+            setMeshData({ positions, indices });
+          }
+        }
+      } catch (meshError) {
+        console.error("[App] Mesh loading error:", meshError);
+        // Continue without mesh - analysis data is still valid
       }
 
       setIsLoading(false);
