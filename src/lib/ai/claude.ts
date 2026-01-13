@@ -1,66 +1,13 @@
 import { fetch } from "@tauri-apps/plugin-http";
 import type {
-  ClaudeRequest,
-  ClaudeResponse,
-  ClaudeMessage,
   StepAnalysisResult,
   Dimension,
   DimensioningResponse,
   ViewType,
 } from "../../types";
 
-const SUB2API_BASE_URL = "https://api.sub2api.com/v1";
-
-// ASME Y14.5 Dimensioning System Prompt
-const DIMENSIONING_SYSTEM_PROMPT = `You are an expert mechanical design engineer specializing in ASME Y14.5 dimensioning standards.
-
-Your task is to analyze 3D model geometry and generate appropriate dimensions for 2D engineering drawings.
-
-ASME Y14.5 Guidelines to follow:
-1. Overall dimensions first (length, width, height)
-2. Feature dimensions (holes, slots, bosses)
-3. Critical dimensions for fit/function
-4. Tolerances based on feature criticality
-5. Reference dimensions in parentheses
-
-Dimension Types:
-- LINEAR: Distance between two points
-- DIAMETER: Circle/hole diameter (prefix with Ø)
-- RADIUS: Arc/fillet radius (prefix with R)
-- ANGULAR: Angle between surfaces
-
-View Assignment:
-- FRONT: Primary profile dimensions
-- TOP: Plan view, hole patterns
-- RIGHT: Depth dimensions, side features
-- ISOMETRIC: Reference only
-
-Output JSON format:
-{
-  "dimensions": [
-    {
-      "id": "dim_1",
-      "type": "linear",
-      "value": 50.0,
-      "tolerance_plus": 0.1,
-      "tolerance_minus": 0.1,
-      "unit": "mm",
-      "view": "front",
-      "position": { "start_x": 0, "start_y": 0, "end_x": 50, "end_y": 0 },
-      "label": "50 ±0.1",
-      "is_critical": true
-    }
-  ],
-  "notes": [
-    "ALL DIMENSIONS IN MILLIMETERS",
-    "BREAK SHARP EDGES 0.5 MAX",
-    "SURFACE FINISH 3.2 Ra UNLESS OTHERWISE SPECIFIED"
-  ],
-  "title_block_suggestions": {
-    "material": "ALUMINUM 6061-T6",
-    "scale": "1:1"
-  }
-}`;
+// Ohmframe Portal API URL
+const PORTAL_API_URL = "https://ai.ohmframe.com/api";
 
 export async function generateDimensions(
   apiKey: string,
@@ -72,7 +19,17 @@ export async function generateDimensions(
   if (!apiKey) {
     return {
       success: false,
-      error: "API key is required",
+      error: "API key is required. Get one from ai.ohmframe.com",
+      dimensions: [],
+      notes: [],
+      title_block_suggestions: {},
+    };
+  }
+
+  if (!apiKey.startsWith("ohm_")) {
+    return {
+      success: false,
+      error: "Invalid API key format. Keys should start with 'ohm_'",
       dimensions: [],
       notes: [],
       title_block_suggestions: {},
@@ -89,107 +46,66 @@ export async function generateDimensions(
     };
   }
 
-  const bbox = stepData.bounding_box;
-  const features = stepData.features;
-
-  // Build the prompt with geometry context
-  const userPrompt = `Analyze this 3D model geometry and generate ${standard} standard dimensions for a 2D engineering drawing.
-
-GEOMETRY DATA:
-- Bounding Box: ${bbox.width.toFixed(2)} x ${bbox.height.toFixed(2)} x ${bbox.depth.toFixed(2)} ${unit}
-- Min Point: (${bbox.min_x.toFixed(2)}, ${bbox.min_y.toFixed(2)}, ${bbox.min_z.toFixed(2)})
-- Max Point: (${bbox.max_x.toFixed(2)}, ${bbox.max_y.toFixed(2)}, ${bbox.max_z.toFixed(2)})
-- Parts Count: ${stepData.parts_count}
-
-FEATURES DETECTED:
-- Holes: ${features?.has_holes ? `Yes (${features.hole_count} detected)` : "No"}
-- Fillets: ${features?.has_fillets ? "Yes" : "No"}
-- Chamfers: ${features?.has_chamfers ? "Yes" : "No"}
-- Surface Count: ${features?.surface_count || "Unknown"}
-
-REQUIREMENTS:
-1. Generate dimensions for views: ${views.join(", ")}
-2. Use ${unit} as the unit of measurement
-3. Apply ${standard} Y14.5 dimensioning standards
-4. Include tolerances for critical dimensions
-5. Add appropriate drawing notes
-
-Respond with valid JSON only.`;
-
   try {
-    const messages: ClaudeMessage[] = [
-      {
-        role: "user",
-        content: userPrompt,
-      },
-    ];
-
-    const request: ClaudeRequest = {
-      model: "claude-sonnet-4-20250514",
-      max_tokens: 4096,
-      messages,
-      system: DIMENSIONING_SYSTEM_PROMPT,
-    };
-
-    const response = await fetch(`${SUB2API_BASE_URL}/messages`, {
+    const response = await fetch(`${PORTAL_API_URL}/drawing`, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
-        "x-api-key": apiKey,
-        "anthropic-version": "2023-06-01",
+        "Authorization": `Bearer ${apiKey}`,
       },
-      body: JSON.stringify(request),
+      body: JSON.stringify({
+        stepData,
+        views,
+        standard,
+        unit,
+      }),
     });
 
     if (!response.ok) {
-      const errorText = await response.text();
+      const errorData = await response.json().catch(() => ({}));
+      const errorMessage = (errorData as { error?: string }).error || `API error (${response.status})`;
+      
+      if (response.status === 401) {
+        return {
+          success: false,
+          error: "Invalid or expired API key. Please check your key at ai.ohmframe.com",
+          dimensions: [],
+          notes: [],
+          title_block_suggestions: {},
+        };
+      }
+      
       return {
         success: false,
-        error: `API error (${response.status}): ${errorText}`,
+        error: errorMessage,
         dimensions: [],
         notes: [],
         title_block_suggestions: {},
       };
     }
 
-    const data = (await response.json()) as ClaudeResponse;
+    const data = await response.json() as DimensioningResponse;
 
-    // Extract text content from Claude response
-    const textContent = data.content.find((c) => c.type === "text");
-    if (!textContent) {
+    if (!data.success) {
       return {
         success: false,
-        error: "No text content in response",
+        error: data.error || "Failed to generate dimensions",
         dimensions: [],
         notes: [],
         title_block_suggestions: {},
       };
     }
-
-    // Parse the JSON response
-    const jsonMatch = textContent.text.match(/\{[\s\S]*\}/);
-    if (!jsonMatch) {
-      return {
-        success: false,
-        error: "Could not parse JSON from response",
-        dimensions: [],
-        notes: [],
-        title_block_suggestions: {},
-      };
-    }
-
-    const parsed = JSON.parse(jsonMatch[0]) as DimensioningResponse;
 
     return {
       success: true,
-      dimensions: parsed.dimensions || [],
-      notes: parsed.notes || [],
-      title_block_suggestions: parsed.title_block_suggestions || {},
+      dimensions: data.dimensions || [],
+      notes: data.notes || [],
+      title_block_suggestions: data.title_block_suggestions || {},
     };
   } catch (error) {
     return {
       success: false,
-      error: error instanceof Error ? error.message : "Unknown error",
+      error: error instanceof Error ? error.message : "Network error - please check your connection",
       dimensions: [],
       notes: [],
       title_block_suggestions: {},
@@ -213,7 +129,7 @@ export function suggestDimensionLayout(
 
   // Offset dimensions to avoid overlap
   const OFFSET = 15; // mm
-  let currentOffset = OFFSET;
+  const currentOffset = OFFSET;
 
   return sorted.map((dim, index) => {
     const offset = currentOffset + index * OFFSET;

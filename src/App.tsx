@@ -64,8 +64,9 @@ function App() {
   const [error, setError] = useState<string | null>(null);
   const [filename, setFilename] = useState<string | null>(null);
 
-  // Settings
-  const [apiKey, setApiKey] = useState(() => localStorage.getItem("sub2api_key") || "");
+  // Settings - use same key as ohmframe-copilot for shared auth
+  const STORAGE_KEY = "ohmframe_api_key";
+  const [apiKey, setApiKey] = useState(() => localStorage.getItem(STORAGE_KEY) || "");
   const [showSettings, setShowSettings] = useState(false);
   const [sheetSize, setSheetSize] = useState<SheetSize>("A3");
   const [unit, setUnit] = useState<"mm" | "in">("mm");
@@ -76,7 +77,7 @@ function App() {
   // Save API key
   useEffect(() => {
     if (apiKey) {
-      localStorage.setItem("sub2api_key", apiKey);
+      localStorage.setItem(STORAGE_KEY, apiKey);
     }
   }, [apiKey]);
 
@@ -161,7 +162,7 @@ function App() {
 
     if (!apiKey) {
       setShowSettings(true);
-      setError("Please enter your Sub2API key");
+      setError("Please enter your Ohmframe API key");
       return;
     }
 
@@ -394,18 +395,19 @@ function App() {
           <div className="modal" onClick={(e) => e.stopPropagation()}>
             <h2>Settings</h2>
             <div className="form-group">
-              <label>Sub2API Key (Claude)</label>
+              <label>Ohmframe API Key</label>
               <input
                 type="password"
                 value={apiKey}
                 onChange={(e) => setApiKey(e.target.value)}
-                placeholder="Enter your Sub2API key"
+                placeholder="ohm_xxxxxxxx..."
               />
               <p className="help-text">
                 Get your API key from{" "}
-                <a href="https://sub2api.com" target="_blank" rel="noreferrer">
-                  sub2api.com
+                <a href="https://ai.ohmframe.com/dashboard" target="_blank" rel="noreferrer">
+                  ai.ohmframe.com
                 </a>
+                {" "}(Enterprise tier required)
               </p>
             </div>
             <div className="modal-actions">
