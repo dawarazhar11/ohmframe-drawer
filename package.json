@@ -1,6 +1,6 @@
 {
   "name": "ohmframe-drawer",
-  "version": "1.1.1",
+  "version": "1.1.2",
   "description": "AI-powered 2D engineering drawing generator from STEP files",
   "private": true,
   "type": "module",
