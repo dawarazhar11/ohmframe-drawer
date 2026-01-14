@@ -10,14 +10,25 @@ import { generateDimensions } from "./lib/ai/claude";
 import { loadStepToMesh } from "./lib/step/stepLoader";
 import {
   renderDrawingSheet,
+  renderDrawingSheetWithViews,
   generateOrthographicViews,
 } from "./lib/drawing/svgRenderer";
+import { generateAllViews, type ProjectedView } from "./lib/drawing/projection";
+import { selectDatums, type DatumFeature } from "./lib/drawing/datums";
+import { generateAllDimensions } from "./lib/drawing/dimensions";
+import {
+  reviewDrawing,
+  applyCorrections,
+  quickQualityCheck,
+  type DrawingReviewResult,
+} from "./lib/ai/drawingReview";
 import type {
   StepAnalysisResult,
   DrawingSheet,
   TitleBlock,
   SheetSize,
   MeshData,
+  Dimension,
 } from "./types";
 
 import "./App.css";
@@ -65,10 +76,18 @@ function App() {
   const [stepData, setStepData] = useState<StepAnalysisResult | null>(null);
   const [meshData, setMeshData] = useState<MeshData | null>(null);
   const [drawing, setDrawing] = useState<DrawingSheet | null>(null);
+  const [projectedViews, setProjectedViews] = useState<ProjectedView[]>([]);
+  const [datums, setDatums] = useState<DatumFeature[]>([]);
   const [isLoading, setIsLoading] = useState(false);
   const [isGenerating, setIsGenerating] = useState(false);
+  const [isReviewing, setIsReviewing] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [filename, setFilename] = useState<string | null>(null);
+  
+  // Review state
+  const [reviewResult, setReviewResult] = useState<DrawingReviewResult | null>(null);
+  const [reviewIteration, setReviewIteration] = useState(0);
+  const [useAdvancedRendering, setUseAdvancedRendering] = useState(true);
 
   // Settings - use same key as ohmframe-copilot for shared auth
   const STORAGE_KEY = "ohmframe_api_key";
@@ -76,6 +95,7 @@ function App() {
   const [showSettings, setShowSettings] = useState(false);
   const [sheetSize, setSheetSize] = useState<SheetSize>("A3");
   const [unit, setUnit] = useState<"mm" | "in">("mm");
+  const [enableReview, setEnableReview] = useState(true);
 
   // Refs
   const svgContainerRef = useRef<HTMLDivElement>(null);
@@ -195,57 +215,212 @@ function App() {
     try {
       setError(null);
       setIsGenerating(true);
+      setReviewResult(null);
+      setReviewIteration(0);
 
-      // Generate dimensions via Claude API
-      const response = await generateDimensions(
-        apiKey,
-        stepData,
-        ["front", "top", "right"],
-        "ASME",
-        unit
-      );
+      let generatedDimensions: Dimension[] = [];
+      let notes: string[] = [];
+      let titleBlockSuggestions: Partial<TitleBlock> = {};
+      let views = generateOrthographicViews(stepData.bounding_box, 1);
+      let localProjectedViews: ProjectedView[] = [];
+      let localDatums: DatumFeature[] = [];
 
-      if (!response.success) {
-        setError(response.error || "Failed to generate dimensions");
-        setIsGenerating(false);
-        return;
+      // Use advanced rendering if mesh data is available
+      if (useAdvancedRendering && meshData) {
+        console.log("[App] Using advanced projection system...");
+        
+        // Generate projected views from actual mesh
+        localProjectedViews = generateAllViews(meshData);
+        setProjectedViews(localProjectedViews);
+        console.log("[App] Generated projected views:", localProjectedViews.map(v => v.type));
+        
+        // Select datums from mesh geometry
+        localDatums = selectDatums(meshData);
+        setDatums(localDatums);
+        console.log("[App] Selected datums:", localDatums.map(d => d.id));
+        
+        // Generate automatic dimensions based on geometry
+        const allDimensions = generateAllDimensions(
+          localProjectedViews,
+          stepData.bounding_box,
+          localDatums,
+          meshData,
+          { unit }
+        );
+        
+        // Flatten dimensions from all views
+        for (const [, dims] of allDimensions) {
+          generatedDimensions.push(...dims);
+        }
+        
+        console.log("[App] Generated", generatedDimensions.length, "automatic dimensions");
+        
+        // Still call AI for additional insights and notes
+        try {
+          const response = await generateDimensions(
+            apiKey,
+            stepData,
+            ["front", "top", "right"],
+            "ASME",
+            unit
+          );
+          
+          if (response.success) {
+            // Merge AI dimensions with auto-generated (AI might add feature-specific ones)
+            const aiDims = response.dimensions.filter(aiDim => 
+              !generatedDimensions.some(autoDim => 
+                Math.abs(autoDim.value - aiDim.value) < 0.1 && autoDim.view === aiDim.view
+              )
+            );
+            generatedDimensions.push(...aiDims);
+            notes = response.notes;
+            titleBlockSuggestions = response.title_block_suggestions;
+          }
+        } catch (aiError) {
+          console.warn("[App] AI dimension generation failed, using auto-generated only:", aiError);
+          notes = [
+            "ALL DIMENSIONS IN " + (unit === "mm" ? "MILLIMETERS" : "INCHES"),
+            "TOLERANCES PER ASME Y14.5",
+            "BREAK SHARP EDGES 0.5 MAX",
+          ];
+        }
+      } else {
+        // Fallback to AI-only dimensioning
+        console.log("[App] Using AI-only dimension generation...");
+        
+        const response = await generateDimensions(
+          apiKey,
+          stepData,
+          ["front", "top", "right"],
+          "ASME",
+          unit
+        );
+
+        if (!response.success) {
+          setError(response.error || "Failed to generate dimensions");
+          setIsGenerating(false);
+          return;
+        }
+        
+        generatedDimensions = response.dimensions;
+        notes = response.notes;
+        titleBlockSuggestions = response.title_block_suggestions;
       }
 
       // Create drawing sheet
       const titleBlock: TitleBlock = {
         part_name: filename?.replace(/\.(step|stp)$/i, "") || "PART",
         part_number: `PN-${Date.now().toString(36).toUpperCase()}`,
-        material: response.title_block_suggestions.material || "SEE SPEC",
-        scale: response.title_block_suggestions.scale || "1:1",
+        material: titleBlockSuggestions.material || "SEE SPEC",
+        scale: titleBlockSuggestions.scale || "1:1",
         drawn_by: "AI GENERATED",
         date: new Date().toISOString().split("T")[0],
       };
-
-      const views = generateOrthographicViews(stepData.bounding_box, 1);
 
       const sheet: DrawingSheet = {
         id: `sheet-${Date.now()}`,
         name: "Sheet 1",
         size: sheetSize,
         views,
-        dimensions: response.dimensions,
-        notes: response.notes,
+        dimensions: generatedDimensions,
+        notes,
         title_block: titleBlock,
       };
 
       setDrawing(sheet);
+      
+      // Run quick local quality check
+      const quickIssues = quickQualityCheck(generatedDimensions);
+      if (quickIssues.length > 0) {
+        console.log("[App] Quick check found issues:", quickIssues);
+      }
+
+      // Run Vision API review if enabled
+      if (enableReview && apiKey) {
+        setIsReviewing(true);
+        await runVisionReview(sheet, localProjectedViews, localDatums);
+        setIsReviewing(false);
+      }
+
       setIsGenerating(false);
     } catch (err) {
       setError(err instanceof Error ? err.message : "Failed to generate drawing");
       setIsGenerating(false);
+      setIsReviewing(false);
     }
-  }, [stepData, apiKey, filename, sheetSize, unit]);
+  }, [stepData, meshData, apiKey, filename, sheetSize, unit, useAdvancedRendering, enableReview]);
+
+  // Run Vision API review and apply corrections
+  const runVisionReview = useCallback(async (
+    sheet: DrawingSheet,
+    views: ProjectedView[],
+    datumFeatures: DatumFeature[]
+  ) => {
+    if (!apiKey || !sheet) return;
+
+    try {
+      console.log("[App] Running Vision API review...");
+      setReviewIteration(prev => prev + 1);
+
+      // Generate SVG for review
+      const svgContent = views.length > 0
+        ? renderDrawingSheetWithViews(sheet, views, datumFeatures)
+        : renderDrawingSheet(sheet);
+
+      // Call Vision API to review
+      const review = await reviewDrawing(
+        apiKey,
+        svgContent,
+        sheet,
+        stepData?.bounding_box ? {
+          boundingBox: {
+            width: stepData.bounding_box.width,
+            height: stepData.bounding_box.height,
+            depth: stepData.bounding_box.depth,
+          },
+        } : undefined
+      );
+
+      setReviewResult(review);
+      console.log("[App] Review result:", {
+        acceptable: review.isAcceptable,
+        score: review.overallScore,
+        issues: review.issues.length,
+        corrections: review.corrections.length,
+      });
+
+      // Apply corrections if needed and score is below threshold
+      if (!review.isAcceptable && review.corrections.length > 0 && reviewIteration < 3) {
+        console.log("[App] Applying", review.corrections.length, "corrections...");
+        const correctedDimensions = applyCorrections(sheet.dimensions, review.corrections);
+        
+        const updatedSheet: DrawingSheet = {
+          ...sheet,
+          dimensions: correctedDimensions,
+        };
+        
+        setDrawing(updatedSheet);
+
+        // Optionally run another review iteration
+        if (review.overallScore < 60) {
+          await runVisionReview(updatedSheet, views, datumFeatures);
+        }
+      }
+    } catch (err) {
+      console.error("[App] Vision review error:", err);
+      // Don't fail the whole process if review fails
+    }
+  }, [apiKey, stepData, reviewIteration]);
 
   // Export SVG
   const handleExportSvg = useCallback(() => {
     if (!drawing) return;
 
-    const svg = renderDrawingSheet(drawing);
+    // Use advanced rendering if we have projected views
+    const svg = projectedViews.length > 0
+      ? renderDrawingSheetWithViews(drawing, projectedViews, datums)
+      : renderDrawingSheet(drawing);
+      
     const blob = new Blob([svg], { type: "image/svg+xml" });
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
@@ -253,7 +428,15 @@ function App() {
     a.download = `${drawing.title_block.part_name}_drawing.svg`;
     a.click();
     URL.revokeObjectURL(url);
-  }, [drawing]);
+  }, [drawing, projectedViews, datums]);
+
+  // Get rendered SVG for display
+  const renderedSvg = useMemo(() => {
+    if (!drawing) return "";
+    return projectedViews.length > 0
+      ? renderDrawingSheetWithViews(drawing, projectedViews, datums)
+      : renderDrawingSheet(drawing);
+  }, [drawing, projectedViews, datums]);
 
   return (
     <div className="app">
@@ -374,7 +557,7 @@ function App() {
             {drawing ? (
               <div
                 className="drawing-preview"
-                dangerouslySetInnerHTML={{ __html: renderDrawingSheet(drawing) }}
+                dangerouslySetInnerHTML={{ __html: renderedSvg }}
               />
             ) : (
               <div className="drawing-placeholder">
@@ -382,12 +565,55 @@ function App() {
                 <ul>
                   <li>Automatic orthographic views (Front, Top, Right)</li>
                   <li>AI-powered ASME Y14.5 dimensioning</li>
+                  <li>Vision API quality review and auto-correction</li>
                   <li>Standard title block and notes</li>
                   <li>Export to SVG for further editing</li>
                 </ul>
               </div>
             )}
           </div>
+
+          {/* Review Status */}
+          {isReviewing && (
+            <div className="review-status">
+              <span className="spinner"></span>
+              <span>Reviewing drawing quality (iteration {reviewIteration})...</span>
+            </div>
+          )}
+
+          {reviewResult && (
+            <div className={`review-result ${reviewResult.isAcceptable ? "acceptable" : "needs-work"}`}>
+              <div className="review-header">
+                <span className="review-score">Quality Score: {reviewResult.overallScore}/100</span>
+                <span className={`review-badge ${reviewResult.isAcceptable ? "pass" : "fail"}`}>
+                  {reviewResult.isAcceptable ? "PASSED" : "NEEDS REVIEW"}
+                </span>
+              </div>
+              {reviewResult.issues.length > 0 && (
+                <div className="review-issues">
+                  <h4>Issues Found ({reviewResult.issues.length})</h4>
+                  <ul>
+                    {reviewResult.issues.slice(0, 5).map((issue, i) => (
+                      <li key={i} className={`issue-${issue.severity}`}>
+                        <span className="issue-severity">{issue.severity.toUpperCase()}</span>
+                        <span className="issue-desc">{issue.description}</span>
+                      </li>
+                    ))}
+                  </ul>
+                </div>
+              )}
+              {reviewResult.suggestions.length > 0 && (
+                <div className="review-suggestions">
+                  <h4>Suggestions</h4>
+                  <ul>
+                    {reviewResult.suggestions.slice(0, 3).map((sug, i) => (
+                      <li key={i}>{sug}</li>
+                    ))}
+                  </ul>
+                </div>
+              )}
+            </div>
+          )}
 
           {/* Dimensions List */}
           {drawing && drawing.dimensions.length > 0 && (
@@ -436,6 +662,37 @@ function App() {
                 {" "}(Enterprise tier required)
               </p>
             </div>
+            
+            <div className="form-group">
+              <label className="checkbox-label">
+                <input
+                  type="checkbox"
+                  checked={useAdvancedRendering}
+                  onChange={(e) => setUseAdvancedRendering(e.target.checked)}
+                />
+                Use Advanced Edge Projection
+              </label>
+              <p className="help-text">
+                Projects actual 3D geometry to 2D views with hidden lines. 
+                Disable for simpler bounding box rendering.
+              </p>
+            </div>
+            
+            <div className="form-group">
+              <label className="checkbox-label">
+                <input
+                  type="checkbox"
+                  checked={enableReview}
+                  onChange={(e) => setEnableReview(e.target.checked)}
+                />
+                Enable Vision API Review
+              </label>
+              <p className="help-text">
+                Uses Claude Vision to review generated drawings and suggest corrections.
+                May increase generation time.
+              </p>
+            </div>
+            
             <div className="modal-actions">
               <button className="btn btn-primary" onClick={() => setShowSettings(false)}>
                 Save
