@@ -9,6 +9,57 @@ import type {
 // Ohmframe Portal API URL
 const PORTAL_API_URL = "https://ai.ohmframe.com/api";
 
+// ASME Y14.5 Dimensioning System Prompt
+const DIMENSIONING_SYSTEM_PROMPT = `You are an expert mechanical design engineer specializing in ASME Y14.5 dimensioning standards.
+
+Your task is to analyze 3D model geometry and generate appropriate dimensions for 2D engineering drawings.
+
+ASME Y14.5 Guidelines to follow:
+1. Overall dimensions first (length, width, height)
+2. Feature dimensions (holes, slots, bosses)
+3. Critical dimensions for fit/function
+4. Tolerances based on feature criticality
+5. Reference dimensions in parentheses
+
+Dimension Types:
+- LINEAR: Distance between two points
+- DIAMETER: Circle/hole diameter (prefix with Ø)
+- RADIUS: Arc/fillet radius (prefix with R)
+- ANGULAR: Angle between surfaces
+
+View Assignment:
+- FRONT: Primary profile dimensions
+- TOP: Plan view, hole patterns
+- RIGHT: Depth dimensions, side features
+- ISOMETRIC: Reference only
+
+Output JSON format:
+{
+  "dimensions": [
+    {
+      "id": "dim_1",
+      "type": "linear",
+      "value": 50.0,
+      "tolerance_plus": 0.1,
+      "tolerance_minus": 0.1,
+      "unit": "mm",
+      "view": "front",
+      "position": { "start_x": 0, "start_y": 0, "end_x": 50, "end_y": 0 },
+      "label": "50 ±0.1",
+      "is_critical": true
+    }
+  ],
+  "notes": [
+    "ALL DIMENSIONS IN MILLIMETERS",
+    "BREAK SHARP EDGES 0.5 MAX",
+    "SURFACE FINISH 3.2 Ra UNLESS OTHERWISE SPECIFIED"
+  ],
+  "title_block_suggestions": {
+    "material": "ALUMINUM 6061-T6",
+    "scale": "1:1"
+  }
+}`;
+
 export async function generateDimensions(
   apiKey: string,
   stepData: StepAnalysisResult,
@@ -46,18 +97,46 @@ export async function generateDimensions(
     };
   }
 
+  const bbox = stepData.bounding_box;
+  const features = stepData.features;
+
+  // Build the prompt with geometry context
+  const userPrompt = `Analyze this 3D model geometry and generate ${standard} standard dimensions for a 2D engineering drawing.
+
+GEOMETRY DATA:
+- Bounding Box: ${bbox.width.toFixed(2)} x ${bbox.height.toFixed(2)} x ${bbox.depth.toFixed(2)} ${unit}
+- Min Point: (${bbox.min_x.toFixed(2)}, ${bbox.min_y.toFixed(2)}, ${bbox.min_z.toFixed(2)})
+- Max Point: (${bbox.max_x.toFixed(2)}, ${bbox.max_y.toFixed(2)}, ${bbox.max_z.toFixed(2)})
+- Parts Count: ${stepData.parts_count}
+
+FEATURES DETECTED:
+- Holes: ${features?.has_holes ? `Yes (${features.hole_count} detected)` : "No"}
+- Fillets: ${features?.has_fillets ? "Yes" : "No"}
+- Chamfers: ${features?.has_chamfers ? "Yes" : "No"}
+- Surface Count: ${features?.surface_count || "Unknown"}
+
+REQUIREMENTS:
+1. Generate dimensions for views: ${views.join(", ")}
+2. Use ${unit} as the unit of measurement
+3. Apply ${standard} Y14.5 dimensioning standards
+4. Include tolerances for critical dimensions
+5. Add appropriate drawing notes
+
+Respond with valid JSON only.`;
+
   try {
-    const response = await fetch(`${PORTAL_API_URL}/drawing`, {
+    // Use the existing /api/vision endpoint with mode=general
+    const response = await fetch(`${PORTAL_API_URL}/vision`, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
         "Authorization": `Bearer ${apiKey}`,
       },
       body: JSON.stringify({
+        prompt: userPrompt,
+        mode: "general",
+        context: DIMENSIONING_SYSTEM_PROMPT,
         stepData,
-        views,
-        standard,
-        unit,
       }),
     });
 
@@ -84,24 +163,50 @@ export async function generateDimensions(
       };
     }
 
-    const data = await response.json() as DimensioningResponse;
+    const data = await response.json() as { success?: boolean; error?: string; response?: string; message?: string };
 
-    if (!data.success) {
+    if (!data.success && data.error) {
       return {
         success: false,
-        error: data.error || "Failed to generate dimensions",
+        error: data.error,
         dimensions: [],
         notes: [],
         title_block_suggestions: {},
       };
     }
 
-    return {
-      success: true,
-      dimensions: data.dimensions || [],
-      notes: data.notes || [],
-      title_block_suggestions: data.title_block_suggestions || {},
-    };
+    // Parse the AI response to extract dimensions
+    const aiResponse = data.response || data.message || "";
+    
+    // Try to parse JSON from the response
+    const jsonMatch = aiResponse.match(/\{[\s\S]*\}/);
+    if (!jsonMatch) {
+      return {
+        success: false,
+        error: "Could not parse dimensions from AI response",
+        dimensions: [],
+        notes: [],
+        title_block_suggestions: {},
+      };
+    }
+
+    try {
+      const parsed = JSON.parse(jsonMatch[0]);
+      return {
+        success: true,
+        dimensions: parsed.dimensions || [],
+        notes: parsed.notes || [],
+        title_block_suggestions: parsed.title_block_suggestions || {},
+      };
+    } catch {
+      return {
+        success: false,
+        error: "Invalid JSON in AI response",
+        dimensions: [],
+        notes: [],
+        title_block_suggestions: {},
+      };
+    }
   } catch (error) {
     return {
       success: false,
