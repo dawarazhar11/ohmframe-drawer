@@ -17,6 +17,11 @@ import { generateAllViews, type ProjectedView } from "./lib/drawing/projection";
 import { selectDatums, type DatumFeature } from "./lib/drawing/datums";
 import { generateAllDimensions } from "./lib/drawing/dimensions";
 import {
+  optimizeDimensionLayout,
+  deduplicateDimensions,
+  filterEssentialDimensions,
+} from "./lib/drawing/dimensionLayout";
+import {
   reviewDrawing,
   applyCorrections,
   quickQualityCheck,
@@ -29,6 +34,7 @@ import type {
   SheetSize,
   MeshData,
   Dimension,
+  BoundingBox,
 } from "./types";
 
 import "./App.css";
@@ -69,6 +75,48 @@ function MeshViewer({ meshData }: { meshData: MeshData | null }) {
       <meshStandardMaterial color="#4a9eff" side={THREE.DoubleSide} />
     </mesh>
   );
+}
+
+// Generate basic dimensions from bounding box (fallback when API unavailable)
+function generateBasicDimensions(bbox: BoundingBox, unit: "mm" | "in"): Dimension[] {
+  const dims: Dimension[] = [];
+  
+  // Front view - width and height
+  dims.push({
+    id: "basic_width",
+    type: "linear",
+    value: bbox.width,
+    unit,
+    view: "front",
+    position: { start_x: 0, start_y: -15, end_x: bbox.width, end_y: -15 },
+    label: `${bbox.width.toFixed(2)}`,
+    is_critical: true,
+  });
+  
+  dims.push({
+    id: "basic_height",
+    type: "linear",
+    value: bbox.height,
+    unit,
+    view: "front",
+    position: { start_x: bbox.width + 15, start_y: 0, end_x: bbox.width + 15, end_y: bbox.height },
+    label: `${bbox.height.toFixed(2)}`,
+    is_critical: true,
+  });
+  
+  // Top view - width and depth
+  dims.push({
+    id: "basic_depth",
+    type: "linear",
+    value: bbox.depth,
+    unit,
+    view: "top",
+    position: { start_x: bbox.width + 15, start_y: 0, end_x: bbox.width + 15, end_y: bbox.depth },
+    label: `${bbox.depth.toFixed(2)}`,
+    is_critical: true,
+  });
+  
+  return dims;
 }
 
 function App() {
@@ -255,7 +303,7 @@ function App() {
         
         console.log("[App] Generated", generatedDimensions.length, "automatic dimensions");
         
-        // Still call AI for additional insights and notes
+        // Still call AI for additional insights and notes (with error handling for 502)
         try {
           const response = await generateDimensions(
             apiKey,
@@ -275,36 +323,82 @@ function App() {
             generatedDimensions.push(...aiDims);
             notes = response.notes;
             titleBlockSuggestions = response.title_block_suggestions;
+          } else if (response.error?.includes("502") || response.error?.includes("503")) {
+            console.warn("[App] API temporarily unavailable, using auto-generated dimensions");
           }
         } catch (aiError) {
           console.warn("[App] AI dimension generation failed, using auto-generated only:", aiError);
+        }
+        
+        // Set default notes if not from AI
+        if (notes.length === 0) {
           notes = [
             "ALL DIMENSIONS IN " + (unit === "mm" ? "MILLIMETERS" : "INCHES"),
             "TOLERANCES PER ASME Y14.5",
             "BREAK SHARP EDGES 0.5 MAX",
           ];
         }
+
+        // IMPORTANT: Clean up and optimize dimension layout
+        console.log("[App] Optimizing dimension layout...");
+        
+        // Step 1: Remove duplicates
+        generatedDimensions = deduplicateDimensions(generatedDimensions);
+        console.log("[App] After dedup:", generatedDimensions.length, "dimensions");
+        
+        // Step 2: Filter to essential dimensions only (max 6 per view)
+        generatedDimensions = filterEssentialDimensions(generatedDimensions, 6);
+        console.log("[App] After filter:", generatedDimensions.length, "dimensions");
+        
+        // Step 3: Optimize layout using simulated annealing
+        if (localProjectedViews.length > 0) {
+          generatedDimensions = optimizeDimensionLayout(generatedDimensions, localProjectedViews);
+          console.log("[App] Layout optimized");
+        }
       } else {
         // Fallback to AI-only dimensioning
         console.log("[App] Using AI-only dimension generation...");
         
-        const response = await generateDimensions(
-          apiKey,
-          stepData,
-          ["front", "top", "right"],
-          "ASME",
-          unit
-        );
+        try {
+          const response = await generateDimensions(
+            apiKey,
+            stepData,
+            ["front", "top", "right"],
+            "ASME",
+            unit
+          );
 
-        if (!response.success) {
-          setError(response.error || "Failed to generate dimensions");
-          setIsGenerating(false);
-          return;
+          if (!response.success) {
+            // Handle 502/503 errors gracefully - use basic dimensions
+            if (response.error?.includes("502") || response.error?.includes("503")) {
+              console.warn("[App] API temporarily unavailable, generating basic dimensions");
+              generatedDimensions = generateBasicDimensions(stepData.bounding_box, unit);
+              notes = [
+                "ALL DIMENSIONS IN " + (unit === "mm" ? "MILLIMETERS" : "INCHES"),
+                "BASIC DIMENSIONS ONLY - API UNAVAILABLE",
+              ];
+            } else {
+              setError(response.error || "Failed to generate dimensions");
+              setIsGenerating(false);
+              return;
+            }
+          } else {
+            generatedDimensions = response.dimensions;
+            notes = response.notes;
+            titleBlockSuggestions = response.title_block_suggestions;
+          }
+        } catch (apiError) {
+          console.warn("[App] API error, generating basic dimensions:", apiError);
+          generatedDimensions = generateBasicDimensions(stepData.bounding_box, unit);
+          notes = [
+            "ALL DIMENSIONS IN " + (unit === "mm" ? "MILLIMETERS" : "INCHES"),
+            "BASIC DIMENSIONS ONLY - API ERROR",
+          ];
         }
         
-        generatedDimensions = response.dimensions;
-        notes = response.notes;
-        titleBlockSuggestions = response.title_block_suggestions;
+        // Clean up AI dimensions too
+        generatedDimensions = deduplicateDimensions(generatedDimensions);
+        generatedDimensions = filterEssentialDimensions(generatedDimensions, 6);
       }
 
       // Create drawing sheet
